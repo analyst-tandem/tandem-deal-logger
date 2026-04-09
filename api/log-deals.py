@@ -42,15 +42,16 @@ def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
                         }
                     },
                     {
-                        "type": "text",
                         "text": (
-                            "Extract all companies from this deal list. "
-                            "Return ONLY a JSON array, no markdown, no preamble. "
-                            "Each object must have exactly these keys: "
-                            "\"name\" (company name), \"domain\" (website domain, e.g. acme.com), "
-                            "\"pitch\" (one-sentence description of what they do). "
-                            "If domain is missing, make your best guess from the company name. "
-                            "Example: [{\"name\": \"Acme\", \"domain\": \"acme.com\", \"pitch\": \"AI for procurement.\"}]"
+                            "Extract all companies from this document. "
+                            "You MUST respond with ONLY a valid JSON array. "
+                            "No markdown, no backticks, no explanation, no text before or after. "
+                            "Just the raw JSON array starting with [ and ending with ]. "
+                            "Each object must have exactly three string keys: "
+                            "name, domain, pitch. "
+                            "Keep pitch under 20 words. "
+                            "If domain is unknown, guess from the company name. "
+                            "Example output: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
                         )
                     }
                 ]
