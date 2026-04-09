@@ -28,7 +28,7 @@ def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
 
     payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 4000,
+        "max_tokens": 5000,
         "messages": [
             {
                 "role": "user",
