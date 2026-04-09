@@ -23,41 +23,71 @@ AFFINITY_HEADERS = {
 
 
 def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
-    """Send PDF to Claude and extract structured deal list."""
+    """Extract deals from PDF, auto-splitting into batches if needed."""
     b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 5000,
-        "messages": [
-            {
+    def call_claude(instruction: str) -> list[dict]:
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4000,
+            "messages": [{
                 "role": "user",
                 "content": [
                     {
                         "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64
-                        }
+                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64}
                     },
                     {
-                        "text": (
-                            "Extract all companies from this document. "
-                            "You MUST respond with ONLY a valid JSON array. "
-                            "No markdown, no backticks, no explanation, no text before or after. "
-                            "Just the raw JSON array starting with [ and ending with ]. "
-                            "Each object must have exactly three string keys: "
-                            "name, domain, pitch. "
-                            "Keep pitch under 20 words. "
-                            "If domain is unknown, guess from the company name. "
-                            "Example output: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
-                        )
+                        "type": "text",
+                        "text": instruction
                     }
                 ]
-            }
-        ]
-    }
+            }]
+        }
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload, timeout=60
+        )
+        r.raise_for_status()
+        text = r.json()["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return json.loads(text)
+
+    # First, count how many companies are in the PDF
+    count_response = call_claude(
+        "How many companies are listed in this document? "
+        "Reply with ONLY a single integer, nothing else."
+    )
+    # count_response will be parsed as JSON — if it's just a number it'll fail, handle that
+    try:
+        total = int(count_response)
+    except (TypeError, ValueError):
+        total = 20  # fallback, just do one batch
+
+    BATCH_SIZE = 20
+    if total <= BATCH_SIZE:
+        # Small list — one call
+        return call_claude(
+            "Extract all companies from this document. "
+            "Respond with ONLY a valid JSON array, no markdown, no backticks. "
+            "Each object must have: name, domain, pitch (under 20 words). "
+            "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
+        )
+    else:
+        # Large list — split into batches
+        all_deals = []
+        for start in range(1, total + 1, BATCH_SIZE):
+            end = min(start + BATCH_SIZE - 1, total)
+            batch = call_claude(
+                f"Extract ONLY companies numbered {start} to {end} from this document. "
+                "Respond with ONLY a valid JSON array, no markdown, no backticks. "
+                "Each object must have: name, domain, pitch (under 20 words). "
+                "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
+            )
+            all_deals.extend(batch)
+        return all_deals
 
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
