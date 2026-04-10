@@ -9,7 +9,6 @@ import base64
 import requests
 from http.server import BaseHTTPRequestHandler
 import cgi
-import io
 
 AFFINITY_API_KEY = os.environ.get("AFFINITY_API_KEY")
 AFFINITY_LIST_ID = os.environ.get("AFFINITY_LIST_ID")
@@ -21,90 +20,87 @@ AFFINITY_HEADERS = {
     "Content-Type": "application/json"
 }
 
+ANTHROPIC_HEADERS = {
+    "x-api-key": ANTHROPIC_API_KEY,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json"
+}
 
-def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
-    """Extract deals from PDF, auto-splitting into batches if needed."""
-    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
-    def call_claude(instruction: str) -> list[dict]:
-        payload = {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 4000,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64}
-                    },
-                    {
-                        "type": "text",
-                        "text": instruction
+def claude_call(b64: str, prompt: str, max_tokens: int = 4000) -> str:
+    """Single Claude API call with a PDF and a prompt. Returns raw text."""
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": b64
                     }
-                ]
-            }]
-        }
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json=payload, timeout=60
-        )
-        r.raise_for_status()
-        text = r.json()["content"][0]["text"].strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        return json.loads(text)
-
-    # First, count how many companies are in the PDF
-    count_response = call_claude(
-        "How many companies are listed in this document? "
-        "Reply with ONLY a single integer, nothing else."
-    )
-    # count_response will be parsed as JSON — if it's just a number it'll fail, handle that
-    try:
-        total = int(count_response)
-    except (TypeError, ValueError):
-        total = 20  # fallback, just do one batch
-
-    BATCH_SIZE = 20
-    if total <= BATCH_SIZE:
-        # Small list — one call
-        return call_claude(
-            "Extract all companies from this document. "
-            "Respond with ONLY a valid JSON array, no markdown, no backticks. "
-            "Each object must have: name, domain, pitch (under 20 words). "
-            "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
-        )
-    else:
-        # Large list — split into batches
-        all_deals = []
-        for start in range(1, total + 1, BATCH_SIZE):
-            end = min(start + BATCH_SIZE - 1, total)
-            batch = call_claude(
-                f"Extract ONLY companies numbered {start} to {end} from this document. "
-                "Respond with ONLY a valid JSON array, no markdown, no backticks. "
-                "Each object must have: name, domain, pitch (under 20 words). "
-                "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
-            )
-            all_deals.extend(batch)
-        return all_deals
-
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }]
+    }
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        },
+        headers=ANTHROPIC_HEADERS,
         json=payload,
         timeout=60
     )
     r.raise_for_status()
-    text = r.json()["content"][0]["text"].strip()
-    # Strip any accidental markdown fences
+    return r.json()["content"][0]["text"].strip()
+
+
+def parse_json(text: str) -> list:
+    """Strip markdown fences and parse JSON."""
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     return json.loads(text)
+
+
+def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
+    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    # Step 1: count companies (cheap call)
+    count_text = claude_call(
+        b64,
+        "How many companies are listed in this document? Reply with ONLY a single integer, nothing else.",
+        max_tokens=10
+    )
+    try:
+        total = int(count_text.strip())
+    except ValueError:
+        total = 20
+
+    BATCH_SIZE = 20
+    json_instruction = (
+        "Respond with ONLY a valid JSON array. No markdown, no backticks, no explanation. "
+        "Each object must have exactly three keys: name, domain, pitch (pitch under 20 words). "
+        "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
+    )
+
+    if total <= BATCH_SIZE:
+        text = claude_call(b64, f"Extract all companies from this document. {json_instruction}")
+        return parse_json(text)
+    else:
+        all_deals = []
+        for start in range(1, total + 1, BATCH_SIZE):
+            end = min(start + BATCH_SIZE - 1, total)
+            text = claude_call(
+                b64,
+                f"Extract ONLY companies numbered {start} to {end} from this document. {json_instruction}"
+            )
+            all_deals.extend(parse_json(text))
+        return all_deals
 
 
 def find_or_create_org(name: str, domain: str) -> tuple[int, str]:
@@ -118,18 +114,21 @@ def find_or_create_org(name: str, domain: str) -> tuple[int, str]:
     for org in r.json().get("organizations", []):
         if domain in org.get("domains", []):
             return org["id"], "found"
-    payload = {"name": name, "domain": domain}
-    r2 = requests.post(f"{AFFINITY_BASE}/organizations", headers=AFFINITY_HEADERS, json=payload, timeout=15)
+    r2 = requests.post(
+        f"{AFFINITY_BASE}/organizations",
+        headers=AFFINITY_HEADERS,
+        json={"name": name, "domain": domain},
+        timeout=15
+    )
     r2.raise_for_status()
     return r2.json()["id"], "created"
 
 
 def add_to_list(org_id: int) -> int:
-    payload = {"entity_id": org_id, "entity_type": 0}
     r = requests.post(
         f"{AFFINITY_BASE}/lists/{AFFINITY_LIST_ID}/list-entries",
         headers=AFFINITY_HEADERS,
-        json=payload,
+        json={"entity_id": org_id, "entity_type": 0},
         timeout=15
     )
     if r.status_code == 422:
@@ -148,13 +147,21 @@ def add_to_list(org_id: int) -> int:
 
 
 def get_field_ids() -> dict:
-    r = requests.get(f"{AFFINITY_BASE}/lists/{AFFINITY_LIST_ID}/fields", headers=AFFINITY_HEADERS, timeout=15)
+    r = requests.get(
+        f"{AFFINITY_BASE}/lists/{AFFINITY_LIST_ID}/fields",
+        headers=AFFINITY_HEADERS,
+        timeout=15
+    )
     r.raise_for_status()
     return {f["name"].lower(): f["id"] for f in r.json()}
 
 
-def set_field_dropdown(entry_id: int, field_id: int, option_text: str):
-    r = requests.get(f"{AFFINITY_BASE}/fields/{field_id}", headers=AFFINITY_HEADERS, timeout=15)
+def set_field_dropdown(entry_id: int, field_id: int, option_text: str) -> bool:
+    r = requests.get(
+        f"{AFFINITY_BASE}/fields/{field_id}",
+        headers=AFFINITY_HEADERS,
+        timeout=15
+    )
     if not r.ok:
         return False
     options = r.json().get("dropdown_options", [])
@@ -170,7 +177,7 @@ def set_field_dropdown(entry_id: int, field_id: int, option_text: str):
     return r2.ok
 
 
-def add_note(org_id: int, pitch: str):
+def add_note(org_id: int, pitch: str) -> bool:
     r = requests.post(
         f"{AFFINITY_BASE}/notes",
         headers=AFFINITY_HEADERS,
@@ -212,10 +219,10 @@ def process_deals(pdf_bytes: bytes) -> dict:
         L("info", f"Processing: {name}")
         try:
             org_id, status = find_or_create_org(name, domain)
-            L("ok", f"  Org {status}: {name} (id={org_id})")
+            L("ok", f"  Org {status}: {name}")
 
             entry_id = add_to_list(org_id)
-            L("ok", f"  Added to pipeline (entry={entry_id})")
+            L("ok", f"  Added to pipeline")
 
             src_id = field_ids.get("internal source")
             if src_id and set_field_dropdown(entry_id, src_id, "Deal Networks"):
