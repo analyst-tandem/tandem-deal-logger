@@ -148,13 +148,14 @@ def add_to_list(org_id: int) -> int:
 
 def get_field_ids() -> dict:
     r = requests.get(
-        f"{AFFINITY_BASE}/lists/{AFFINITY_LIST_ID}/fields",
+        f"{AFFINITY_BASE}/v2/lists/{AFFINITY_LIST_ID}/fields",
         headers=AFFINITY_HEADERS,
         timeout=15
     )
     r.raise_for_status()
-    return {f["name"].lower(): f["id"] for f in r.json()}
-
+    data = r.json()
+    fields = data.get("data", data) if isinstance(data, dict) else data
+    return {f["name"].lower(): f["id"] for f in fields}
 
 def set_field_dropdown(entry_id: int, field_id: int, option_text: str) -> bool:
     r = requests.get(
