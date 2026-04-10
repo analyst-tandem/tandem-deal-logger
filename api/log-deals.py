@@ -28,7 +28,6 @@ ANTHROPIC_HEADERS = {
 
 
 def claude_call(b64: str, prompt: str, max_tokens: int = 4000) -> str:
-    """Single Claude API call with a PDF and a prompt. Returns raw text."""
     payload = {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": max_tokens,
@@ -60,20 +59,27 @@ def claude_call(b64: str, prompt: str, max_tokens: int = 4000) -> str:
     return r.json()["content"][0]["text"].strip()
 
 
-def parse_json(text: str) -> list:
-    """Strip markdown fences and parse JSON."""
+def parse_json_response(text: str) -> list:
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     return json.loads(text)
 
 
-def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
+def extract_deals_from_pdf(pdf_bytes: bytes) -> list:
     b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
-    # Step 1: count companies (cheap call)
+    json_instruction = (
+        "Respond with ONLY a valid JSON array. "
+        "No markdown, no backticks, no explanation before or after. "
+        "Each object must have exactly three string keys: name, domain, pitch. "
+        "Keep pitch under 20 words. If domain unknown, guess from company name. "
+        'Example: [{"name":"Acme","domain":"acme.com","pitch":"AI for procurement."}]'
+    )
+
+    # Step 1: count companies
     count_text = claude_call(
         b64,
-        "How many companies are listed in this document? Reply with ONLY a single integer, nothing else.",
+        "How many numbered companies are listed in this document? Reply with ONLY a single integer.",
         max_tokens=10
     )
     try:
@@ -82,28 +88,26 @@ def extract_deals_from_pdf(pdf_bytes: bytes) -> list[dict]:
         total = 20
 
     BATCH_SIZE = 20
-    json_instruction = (
-        "Respond with ONLY a valid JSON array. No markdown, no backticks, no explanation. "
-        "Each object must have exactly three keys: name, domain, pitch (pitch under 20 words). "
-        "Example: [{\"name\":\"Acme\",\"domain\":\"acme.com\",\"pitch\":\"AI for procurement.\"}]"
-    )
 
     if total <= BATCH_SIZE:
-        text = claude_call(b64, f"Extract all companies from this document. {json_instruction}")
-        return parse_json(text)
+        text = claude_call(
+            b64,
+            f"Extract all {total} companies from this document. {json_instruction}"
+        )
+        return parse_json_response(text)
     else:
         all_deals = []
         for start in range(1, total + 1, BATCH_SIZE):
             end = min(start + BATCH_SIZE - 1, total)
             text = claude_call(
                 b64,
-                f"Extract ONLY companies numbered {start} to {end} from this document. {json_instruction}"
+                f"Extract ONLY the companies numbered {start} through {end} from this document. {json_instruction}"
             )
-            all_deals.extend(parse_json(text))
+            all_deals.extend(parse_json_response(text))
         return all_deals
 
 
-def find_or_create_org(name: str, domain: str) -> tuple[int, str]:
+def find_or_create_org(name: str, domain: str):
     r = requests.get(
         f"{AFFINITY_BASE}/organizations",
         headers=AFFINITY_HEADERS,
@@ -157,7 +161,8 @@ def get_field_ids() -> dict:
     fields = data.get("data", data) if isinstance(data, dict) else data
     return {f["name"].lower(): f["id"] for f in fields}
 
-def set_field_dropdown(entry_id: int, field_id: int, option_text: str) -> bool:
+
+def set_field_dropdown(entry_id: int, field_id, option_text: str) -> bool:
     r = requests.get(
         f"{AFFINITY_BASE}/fields/{field_id}",
         headers=AFFINITY_HEADERS,
@@ -166,7 +171,10 @@ def set_field_dropdown(entry_id: int, field_id: int, option_text: str) -> bool:
     if not r.ok:
         return False
     options = r.json().get("dropdown_options", [])
-    option_id = next((o["id"] for o in options if o["text"].lower() == option_text.lower()), None)
+    option_id = next(
+        (o["id"] for o in options if o["text"].lower() == option_text.lower()),
+        None
+    )
     if not option_id:
         return False
     r2 = requests.post(
@@ -184,7 +192,7 @@ def add_note(org_id: int, pitch: str) -> bool:
         headers=AFFINITY_HEADERS,
         json={
             "organization_ids": [org_id],
-            "content": f"**Inbound Pitch (Deal Networks)**\n\n{pitch}"
+            "content": f"Inbound Pitch (Deal Networks)\n\n{pitch}"
         },
         timeout=15
     )
@@ -209,9 +217,10 @@ def process_deals(pdf_bytes: bytes) -> dict:
 
     try:
         field_ids = get_field_ids()
+        L("ok", f"Loaded {len(field_ids)} Affinity fields")
     except Exception as e:
-        L("err", f"Could not fetch Affinity field IDs: {e}")
-        return {"logged": [], "failed": [], "log": log}
+        L("warn", f"Could not fetch field IDs ({e}) — will skip field updates")
+        field_ids = {}
 
     for deal in deals:
         name = deal.get("name", "Unknown")
@@ -223,13 +232,13 @@ def process_deals(pdf_bytes: bytes) -> dict:
             L("ok", f"  Org {status}: {name}")
 
             entry_id = add_to_list(org_id)
-            L("ok", f"  Added to pipeline")
+            L("ok", "  Added to pipeline")
 
             src_id = field_ids.get("internal source")
             if src_id and set_field_dropdown(entry_id, src_id, "Deal Networks"):
                 L("ok", "  Internal Source → Deal Networks")
             else:
-                L("warn", "  Could not set Internal Source")
+                L("warn", "  Skipped Internal Source")
 
             if add_note(org_id, pitch):
                 L("ok", "  Note added")
@@ -240,7 +249,7 @@ def process_deals(pdf_bytes: bytes) -> dict:
             if stat_id and set_field_dropdown(entry_id, stat_id, "Passed"):
                 L("ok", "  Status → Passed")
             else:
-                L("warn", "  Could not set Status")
+                L("warn", "  Skipped Status")
 
             logged.append(name)
         except Exception as e:
